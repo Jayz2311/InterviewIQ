@@ -1,0 +1,145 @@
+import crypto from "crypto";
+import { NextResponse } from "next/server";
+import nodemailer from "nodemailer";
+import pdfParse from "pdf-parse-fixed";
+import { saveInterviewData } from "../../../lib/storage.js";
+
+export async function POST(req) {
+  try {
+    const formData = await req.formData();
+    const file = formData.get("file");
+    const email = formData.get("email");
+
+    // 1️⃣ Validate inputs
+    if (!file || !email) {
+      console.error("❌ Missing file or email in upload");
+      return NextResponse.json(
+        { error: "Please provide both a CV file and an email address." },
+        { status: 400 }
+      );
+    }
+
+    if (!file.name.endsWith(".pdf")) {
+      console.error("❌ Invalid file type:", file.name);
+      return NextResponse.json(
+        { error: "Only PDF files are allowed." },
+        { status: 400 }
+      );
+    }
+
+    // 2️⃣ Extract text from PDF
+    const buffer = Buffer.from(await file.arrayBuffer());
+    const pdfData = await pdfParse(buffer);
+    const text = pdfData.text || "";
+    console.log("📄 Extracted CV text length:", text.length);
+
+    // 3️⃣ Generate a unique token for this interview
+    const token = crypto.randomBytes(16).toString("hex");
+    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://ai-interview-platform-qerb.onrender.com';
+    const meetingLink = `${baseUrl}/interview/${token}`;
+    console.log("🎟️ Generated token:", token);
+    console.log("🔗 Meeting link:", meetingLink);
+
+    // 🔒 Store interview data persistently
+    saveInterviewData(token, { cvText: text, email });
+    console.log("✅ Stored interview data for token:", token);
+
+    // 4️⃣ Send meeting link by email (async, don't wait)
+    console.log("📧 Queueing email to send...");
+    
+    // Send email in background without blocking the response
+    sendEmailAsync(email, meetingLink).catch(err => {
+      console.error("❌ Failed to send email:", err);
+    });
+
+    // 5️⃣ Respond to frontend immediately (don't wait for email)
+    return NextResponse.json({
+      success: true,
+      message: "CV uploaded successfully! You will receive the interview link in your email within a minute.",
+      token,
+    });
+  } catch (err) {
+    console.error("❌ Error processing upload:", err);
+    return NextResponse.json(
+      { error: "Failed to process the file. Please try again." },
+      { status: 500 }
+    );
+  }
+}
+
+// Helper function to send email asynchronously with Gmail (better error handling)
+async function sendEmailAsync(email, meetingLink) {
+  const maxRetries = 3;
+  let attempt = 0;
+
+  while (attempt < maxRetries) {
+    try {
+      attempt++;
+      console.log(`📧 Attempt ${attempt}/${maxRetries} - Sending email to:`, email);
+      
+      const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+          user: process.env.GMAIL_USER,
+          pass: process.env.GMAIL_APP_PASSWORD,
+        },
+        // Add timeouts
+        connectionTimeout: 30000, // 30 seconds
+        greetingTimeout: 30000,
+        socketTimeout: 30000,
+      });
+
+      const mailOptions = {
+        from: `"AI Interview Platform" <${process.env.GMAIL_USER}>`,
+        to: email,
+        subject: 'Your AI Interview Link',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #2563EB;">Your AI Interview is Ready!</h2>
+            <p>Hello,</p>
+            <p>Your AI interview has been scheduled and is ready to start.</p>
+            <p style="margin: 30px 0;">
+              <a href="${meetingLink}" 
+                 style="background-color: #2563EB; 
+                        color: white; 
+                        padding: 12px 30px; 
+                        text-decoration: none; 
+                        border-radius: 5px;
+                        font-weight: bold;
+                        display: inline-block;">
+                Start Interview Now
+              </a>
+            </p>
+            <p style="color: #666; font-size: 14px;">
+              Or copy this link: <br/>
+              <a href="${meetingLink}" style="color: #2563EB;">${meetingLink}</a>
+            </p>
+            <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;"/>
+            <p style="color: #888; font-size: 12px;">
+              Best of luck!<br/>
+              — AI Interview Platform Team
+            </p>
+          </div>
+        `,
+      };
+
+      const info = await transporter.sendMail(mailOptions);
+      console.log(`✅ Email sent successfully to: ${email} | Message ID: ${info.messageId}`);
+      return; // Success, exit function
+
+    } catch (error) {
+      console.error(`❌ Attempt ${attempt} failed:`, error.message);
+      
+      // If this was the last attempt, throw the error
+      if (attempt >= maxRetries) {
+        console.error(`❌ All ${maxRetries} attempts failed. Giving up.`);
+        throw new Error(`Failed to send email after ${maxRetries} attempts: ${error.message}`);
+      }
+      
+      // Wait before retrying (exponential backoff)
+      const waitTime = attempt * 2000; // 2s, 4s, 6s
+      console.log(`⏳ Waiting ${waitTime/1000}s before retry...`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
+  }
+}
